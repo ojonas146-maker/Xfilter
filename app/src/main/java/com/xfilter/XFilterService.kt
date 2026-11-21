@@ -20,7 +20,10 @@ class XFilterService : AccessibilityService() {
 
     companion object {
         const val PKG = "com.twitter.android"
-        private val CARET_DESC = setOf("mais opcoes", "mais", "more", "more options", "mas opciones")
+        private val CARET_DESC = setOf(
+            "opcoes do post", "opcoes da postagem", "post options", "more post options",
+            "mais opcoes", "mais", "more", "more options", "mas opciones"
+        )
         private val NOT_INT = listOf("nao tenho interesse", "not interested", "no me interesa", "nao me interessa")
         private val MUTE = listOf("silenciar @", "mute @", "silenciar a @")
         private val MENU_HINTS = listOf(
