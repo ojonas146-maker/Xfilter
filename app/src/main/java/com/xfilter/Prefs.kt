@@ -12,19 +12,26 @@ object Prefs {
     private fun sp(c: Context) = c.getSharedPreferences("xfilter", Context.MODE_PRIVATE)
 
     fun enabled(c: Context) = sp(c).getBoolean("enabled", true)
-    fun dryRun(c: Context) = sp(c).getBoolean("dry", true) // começa em modo teste
+    fun dryRun(c: Context) = sp(c).getBoolean("dry", false)
     fun interestsMode(c: Context) = sp(c).getBoolean("interestsMode", false)
     fun maxPerHour(c: Context) = sp(c).getInt("maxPerHour", 60)
     fun total(c: Context) = sp(c).getInt("total", 0)
     fun dumpAt(c: Context) = sp(c).getLong("dumpAt", 0L)
 
-    fun setBool(c: Context, key: String, v: Boolean) = sp(c).edit().putBoolean(key, v).apply()
-    fun setInt(c: Context, key: String, v: Int) = sp(c).edit().putInt(key, v).apply()
+    // "ver" muda a cada alteração de configuração; o serviço limpa a memória de posts quando muda
+    fun version(c: Context) = sp(c).getInt("ver", 0)
+    fun setBool(c: Context, key: String, v: Boolean) =
+        sp(c).edit().putBoolean(key, v).putInt("ver", version(c) + 1).apply()
+    fun setInt(c: Context, key: String, v: Int) =
+        sp(c).edit().putInt(key, v).putInt("ver", version(c) + 1).apply()
+    fun setStatus(c: Context, s: String) = sp(c).edit().putString("status", s).apply()
+    fun status(c: Context): String = sp(c).getString("status", "(nenhuma leitura ainda)") ?: ""
     fun setDumpAt(c: Context, v: Long) = sp(c).edit().putLong("dumpAt", v).apply()
     fun incTotal(c: Context) = sp(c).edit().putInt("total", total(c) + 1).apply()
 
     fun text(c: Context, key: String): String = sp(c).getString(key, DEFAULTS[key] ?: "") ?: ""
-    fun setText(c: Context, key: String, v: String) = sp(c).edit().putString(key, v).apply()
+    fun setText(c: Context, key: String, v: String) =
+        sp(c).edit().putString(key, v).putInt("ver", version(c) + 1).apply()
     fun list(c: Context, key: String): List<String> =
         text(c, key).split('\n').map { it.trim() }.filter { it.isNotEmpty() }
 

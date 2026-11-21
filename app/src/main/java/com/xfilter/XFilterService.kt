@@ -12,6 +12,9 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.Toast
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class XFilterService : AccessibilityService() {
 
@@ -31,12 +34,17 @@ class XFilterService : AccessibilityService() {
 
     private val handler = Handler(Looper.getMainLooper())
     private var state = State.IDLE
-    private var stateSince = 0L
     private var target: Target? = null
     private var lastXEvent = 0L
     private var lastAction = 0L
+    private var lastStatusAt = 0L
     private var scanQueued = false
-    private val handled = LinkedHashSet<String>()
+    private var settingsVersion = -1
+    private var lastSeen = ""
+
+    private val handled = LinkedHashSet<String>()    // posts já resolvidos de verdade
+    private val dryLogged = LinkedHashSet<String>()  // posts já registrados no modo teste
+    private val tries = HashMap<String, Int>()
     private val actionTimes = mutableListOf<Long>()
 
     private val scanRunnable = Runnable {
@@ -54,14 +62,16 @@ class XFilterService : AccessibilityService() {
 
     private val timeout = Runnable {
         if (state == State.WAIT_MENU) {
-            Prefs.addLog(this@XFilterService, "⚠ menu não abriu / opção não encontrada")
+            Prefs.addLog(this@XFilterService, "⚠ menu não apareceu. Textos vistos: " + lastSeen.ifEmpty { "(nada)" })
             reset()
+            lastAction = SystemClock.elapsedRealtime()
         }
     }
 
     override fun onServiceConnected() {
         handler.removeCallbacks(poll)
         handler.postDelayed(poll, 2000)
+        Prefs.setStatus(this, "serviço conectado — abra o X")
     }
 
     override fun onInterrupt() {}
@@ -82,29 +92,55 @@ class XFilterService : AccessibilityService() {
 
     // ---------------------------------------------------------------- núcleo
 
+    private fun xRoots(): List<AccessibilityNodeInfo> {
+        val out = ArrayList<AccessibilityNodeInfo>()
+        try {
+            for (w in windows) {
+                val r = w.root ?: continue
+                if (r.packageName?.toString() == PKG) out.add(r)
+            }
+        } catch (e: Exception) {
+            // sem acesso às janelas: cai no fallback abaixo
+        }
+        if (out.isEmpty()) {
+            val a = rootInActiveWindow
+            if (a != null && a.packageName?.toString() == PKG) out.add(a)
+        }
+        return out
+    }
+
     private fun tick() {
-        val root = rootInActiveWindow ?: return
-        if (root.packageName?.toString() != PKG) return
-        maybeDump(root)
-        if (!Prefs.enabled(this)) return
+        val roots = xRoots()
+        if (roots.isEmpty()) return
+        maybeDump(roots.first())
+        if (!Prefs.enabled(this)) {
+            status("filtro desligado")
+            return
+        }
+        val v = Prefs.version(this)
+        if (v != settingsVersion) {
+            settingsVersion = v
+            handled.clear(); dryLogged.clear(); tries.clear()
+        }
         when (state) {
-            State.IDLE -> scanFeed(root)
-            State.WAIT_MENU -> handleMenu(root)
+            State.IDLE -> scanFeed(roots.last()) // última = janela de baixo = o app em si
+            State.WAIT_MENU -> handleMenu(roots)
         }
     }
 
     private fun scanFeed(root: AccessibilityNodeInfo) {
         val now = SystemClock.elapsedRealtime()
-        if (now - lastAction < 2000) return
-
         val cfg = Prefs.config(this)
         val hasRules = cfg.words.isNotEmpty() || cfg.accounts.isNotEmpty() ||
             (cfg.interestsMode && cfg.interests.isNotEmpty())
-        if (!hasRules) return
+        if (!hasRules) {
+            status("sem regras cadastradas")
+            return
+        }
 
         val dry = Prefs.dryRun(this)
         actionTimes.removeAll { now - it > 3_600_000L }
-        if (!dry && actionTimes.size >= Prefs.maxPerHour(this)) return
+        val limited = !dry && actionTimes.size >= Prefs.maxPerHour(this)
 
         val carets = ArrayList<AccessibilityNodeInfo>()
         walk(root) { if (isCaret(it)) carets.add(it) }
@@ -112,43 +148,60 @@ class XFilterService : AccessibilityService() {
         carets.sortBy { n -> n.getBoundsInScreen(r); r.top }
         val h = resources.displayMetrics.heightPixels
 
+        var rows = 0
+        var hits = 0
+        var acted = false
+
         for (caret in carets) {
             caret.getBoundsInScreen(r)
-            // só age em posts bem visíveis (evita clicar em algo cortado/atrás de barra)
             if (r.centerY() < h * 0.12 || r.centerY() > h * 0.88) continue
 
             val row = rowOf(caret) ?: continue
             val text = rowText(row)
             if (text.length < 5) continue
+            rows++
 
             val key = text.filter { it.isLetter() }.take(90).hashCode().toString()
-            if (key in handled) continue
-
             val hit = Matcher.check(text, cfg) ?: continue
-            remember(key)
+            hits++
             val preview = text.replace('\n', ' ').take(90)
 
             if (dry) {
-                Prefs.addLog(this, "[TESTE] ${hit.reason}: $preview")
+                if (dryLogged.add(key)) Prefs.addLog(this, "[TESTE] ${hit.reason}: $preview")
                 continue
             }
+            if (acted || limited || key in handled || now - lastAction < 2000) continue
+
+            val n = tries[key] ?: 0
+            if (n >= 2) {
+                handled.add(key)
+                Prefs.addLog(this, "⚠ desisti após 2 tentativas: $preview")
+                continue
+            }
+            tries[key] = n + 1
+
             if (clickNode(caret)) {
                 target = Target(key, hit, preview)
                 state = State.WAIT_MENU
-                stateSince = now
                 lastAction = now
+                lastSeen = ""
+                acted = true
                 handler.removeCallbacks(timeout)
                 handler.postDelayed(timeout, 3500)
-                return
+            } else {
+                Prefs.addLog(this, "⚠ não consegui tocar no ⋮ (${describe(caret)})")
             }
         }
+
+        status("⋮ ${carets.size} · posts $rows · casaram $hits · " +
+            (if (dry) "TESTE" else if (limited) "limite/hora" else "ativo"))
     }
 
-    private fun handleMenu(root: AccessibilityNodeInfo) {
+    private fun handleMenu(roots: List<AccessibilityNodeInfo>) {
         val t = target ?: run { reset(); return }
 
         val nodes = ArrayList<AccessibilityNodeInfo>()
-        walk(root) { if (!it.text.isNullOrBlank()) nodes.add(it) }
+        for (r in roots) walk(r) { if (!it.text.isNullOrBlank()) nodes.add(it) }
         val labels = nodes.map { Matcher.norm(it.text.toString()).trim() }
 
         val notInt = labels.indexOfFirst { l -> NOT_INT.any { l.startsWith(it) } }
@@ -157,7 +210,10 @@ class XFilterService : AccessibilityService() {
         else -1
         val menuOpen = notInt >= 0 || mute >= 0 ||
             labels.any { l -> MENU_HINTS.any { l.startsWith(it) } }
-        if (!menuOpen) return // ainda abrindo; o timeout cuida do resto
+        if (!menuOpen) {
+            lastSeen = labels.filter { it.length in 2..40 }.take(14).joinToString(" | ")
+            return
+        }
 
         handler.removeCallbacks(timeout)
         val pick = if (mute >= 0) mute else notInt
@@ -167,9 +223,11 @@ class XFilterService : AccessibilityService() {
             val icon = if (pick == mute) "🔇 silenciou" else "🚫"
             Prefs.addLog(this, "$icon ${t.hit.reason}: ${t.preview}")
         } else {
-            Prefs.addLog(this, "⚠ menu sem a opção (${t.hit.reason}) — fechando")
+            val vistos = labels.filter { it.length in 2..40 }.take(10).joinToString(" | ")
+            Prefs.addLog(this, "⚠ menu abriu mas sem a opção. Vi: $vistos")
             performGlobalAction(GLOBAL_ACTION_BACK)
         }
+        handled.add(t.key)
         reset()
         lastAction = SystemClock.elapsedRealtime()
     }
@@ -180,9 +238,12 @@ class XFilterService : AccessibilityService() {
         handler.removeCallbacks(timeout)
     }
 
-    private fun remember(k: String) {
-        handled.add(k)
-        if (handled.size > 600) handled.remove(handled.first())
+    private fun status(s: String) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastStatusAt < 1000) return
+        lastStatusAt = now
+        val hora = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+        Prefs.setStatus(this, "$hora · $s")
     }
 
     // ---------------------------------------------------------------- árvore de nós
@@ -199,14 +260,23 @@ class XFilterService : AccessibilityService() {
         return n.isClickable && Matcher.norm(d).trim() in CARET_DESC
     }
 
-    // sobe a partir do ⋮ enquanto o ancestral contiver só 1 ⋮ → esse é o "post"
+    private fun describe(n: AccessibilityNodeInfo) =
+        "id=${n.viewIdResourceName?.substringAfter(":id/")} desc=${n.contentDescription} click=${n.isClickable}"
+
+    // sobe a partir do ⋮ enquanto o ancestral tiver só 1 ⋮ e começar perto do ⋮ (não engole anúncio de cima)
     private fun rowOf(caret: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val cb = Rect()
+        caret.getBoundsInScreen(cb)
+        val maxUp = (90 * resources.displayMetrics.density).toInt()
+        val pb = Rect()
         var best: AccessibilityNodeInfo? = null
         var cur: AccessibilityNodeInfo = caret
         for (i in 0 until 14) {
             val p = cur.parent ?: break
             val cls = p.className?.toString() ?: ""
             if (cls.contains("RecyclerView") || cls.contains("ListView") || cls.contains("ScrollView")) break
+            p.getBoundsInScreen(pb)
+            if (pb.top < cb.top - maxUp) break
             var c = 0
             walk(p) { if (isCaret(it)) c++ }
             if (c > 1) break

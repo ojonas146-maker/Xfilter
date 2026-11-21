@@ -12,6 +12,7 @@ import android.widget.*
 class MainActivity : Activity() {
 
     private lateinit var status: TextView
+    private lateinit var scan: TextView
     private lateinit var total: TextView
     private lateinit var logView: TextView
     private lateinit var swInterests: Switch
@@ -61,8 +62,13 @@ class MainActivity : Activity() {
         }
         setContentView(ScrollView(this).apply { addView(root) })
 
-        label(root, "X Filter", 26f)
+        label(root, "X Filter 1.1", 26f)
         status = label(root, "")
+        scan = label(root, "")
+        total = label(root, "", 16f)
+        button(root, "ATUALIZAR status e log") { refresh() }
+        logView = label(root, "", 12f)
+
         button(root, "1) Abrir Acessibilidade e ativar o X Filter") {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         }
@@ -101,11 +107,7 @@ class MainActivity : Activity() {
             Prefs.setDumpAt(this, System.currentTimeMillis() + 8000)
             Toast.makeText(this, "Abra o X agora e deixe o post/menu na tela", Toast.LENGTH_LONG).show()
         }
-
-        total = label(root, "", 16f)
-        button(root, "Atualizar log") { refresh() }
         button(root, "Limpar log") { Prefs.clearLog(this); refresh() }
-        logView = label(root, "", 12f)
     }
 
     override fun onResume() {
@@ -128,7 +130,8 @@ class MainActivity : Activity() {
 
     private fun refresh() {
         status.text = if (serviceOn()) "✅ Serviço ativo" else "❌ Serviço desligado"
+        scan.text = "Última leitura: " + Prefs.status(this)
         total.text = "Posts filtrados: ${Prefs.total(this)}"
-        logView.text = Prefs.log(this).joinToString("\n\n").ifEmpty { "(log vazio)" }
+        logView.text = Prefs.log(this).take(8).joinToString("\n\n").ifEmpty { "(log vazio)" }
     }
 }
