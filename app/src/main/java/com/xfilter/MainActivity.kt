@@ -62,7 +62,7 @@ class MainActivity : Activity() {
         }
         setContentView(ScrollView(this).apply { addView(root) })
 
-        label(root, "X Filter 1.1", 26f)
+        label(root, "X Filter 1.2", 26f)
         status = label(root, "")
         scan = label(root, "")
         total = label(root, "", 16f)

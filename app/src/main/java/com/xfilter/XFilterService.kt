@@ -102,17 +102,15 @@ class XFilterService : AccessibilityService() {
         } catch (e: Exception) {
             // sem acesso às janelas: cai no fallback abaixo
         }
-        if (out.isEmpty()) {
-            val a = rootInActiveWindow
-            if (a != null && a.packageName?.toString() == PKG) out.add(a)
-        }
+        val a = rootInActiveWindow
+        if (a != null && a.packageName?.toString() == PKG && out.none { it.windowId == a.windowId }) out.add(a)
         return out
     }
 
     private fun tick() {
         val roots = xRoots()
         if (roots.isEmpty()) return
-        maybeDump(roots.first())
+        maybeDump(roots)
         if (!Prefs.enabled(this)) {
             status("filtro desligado")
             return
@@ -123,12 +121,12 @@ class XFilterService : AccessibilityService() {
             handled.clear(); dryLogged.clear(); tries.clear()
         }
         when (state) {
-            State.IDLE -> scanFeed(roots.last()) // última = janela de baixo = o app em si
+            State.IDLE -> scanFeed(roots)
             State.WAIT_MENU -> handleMenu(roots)
         }
     }
 
-    private fun scanFeed(root: AccessibilityNodeInfo) {
+    private fun scanFeed(roots: List<AccessibilityNodeInfo>) {
         val now = SystemClock.elapsedRealtime()
         val cfg = Prefs.config(this)
         val hasRules = cfg.words.isNotEmpty() || cfg.accounts.isNotEmpty() ||
@@ -143,7 +141,12 @@ class XFilterService : AccessibilityService() {
         val limited = !dry && actionTimes.size >= Prefs.maxPerHour(this)
 
         val carets = ArrayList<AccessibilityNodeInfo>()
-        walk(root) { if (isCaret(it)) carets.add(it) }
+        var nodeCount = 0
+        for (rt in roots) walk(rt) {
+            nodeCount++
+            if (isCaret(it)) carets.add(it)
+        }
+        if (carets.isEmpty()) diagnoseNoCaret(roots, nodeCount)
         val r = Rect()
         carets.sortBy { n -> n.getBoundsInScreen(r); r.top }
         val h = resources.displayMetrics.heightPixels
@@ -193,7 +196,7 @@ class XFilterService : AccessibilityService() {
             }
         }
 
-        status("⋮ ${carets.size} · posts $rows · casaram $hits · " +
+        status("janelas ${roots.size} · nós $nodeCount · ⋮ ${carets.size} · posts $rows · casaram $hits · " +
             (if (dry) "TESTE" else if (limited) "limite/hora" else "ativo"))
     }
 
@@ -260,6 +263,24 @@ class XFilterService : AccessibilityService() {
         return n.isClickable && Matcher.norm(d).trim() in CARET_DESC
     }
 
+    private var lastDiagAt = 0L
+
+    private fun diagnoseNoCaret(roots: List<AccessibilityNodeInfo>, nodeCount: Int) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastDiagAt < 60000) return
+        lastDiagAt = now
+        val descs = LinkedHashSet<String>()
+        val ids = LinkedHashSet<String>()
+        for (rt in roots) walk(rt) {
+            val d = it.contentDescription?.toString()
+            if (it.isClickable && !d.isNullOrBlank()) descs.add(d.take(25))
+            val id = it.viewIdResourceName
+            if (it.isClickable && id != null) ids.add(id.substringAfter(":id/"))
+        }
+        Prefs.addLog(this, "⚠ 0 ⋮ em $nodeCount nós (${roots.size} janelas). " +
+            "Clicáveis desc: ${descs.take(12).joinToString(" | ")} · ids: ${ids.take(12).joinToString(" | ")}")
+    }
+
     private fun describe(n: AccessibilityNodeInfo) =
         "id=${n.viewIdResourceName?.substringAfter(":id/")} desc=${n.contentDescription} click=${n.isClickable}"
 
@@ -313,7 +334,7 @@ class XFilterService : AccessibilityService() {
 
     // ---------------------------------------------------------------- diagnóstico
 
-    private fun maybeDump(root: AccessibilityNodeInfo) {
+    private fun maybeDump(roots: List<AccessibilityNodeInfo>) {
         val at = Prefs.dumpAt(this)
         if (at <= 0 || System.currentTimeMillis() < at) return
         Prefs.setDumpAt(this, 0L)
@@ -337,7 +358,10 @@ class XFilterService : AccessibilityService() {
             }
             for (i in 0 until n.childCount) rec(n.getChild(i), d + 1)
         }
-        rec(root, 0)
+        for ((i, rt) in roots.withIndex()) {
+            sb.append("=== janela ").append(i).append(" ===\n")
+            rec(rt, 0)
+        }
 
         File(filesDir, "dump.txt").writeText(sb.toString())
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
