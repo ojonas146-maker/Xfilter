@@ -4,12 +4,18 @@ import android.accessibilityservice.AccessibilityService
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.graphics.Color
+import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.Gravity
+import android.view.WindowManager
+import android.widget.TextView
 import android.widget.Toast
 import java.io.File
 import java.text.SimpleDateFormat
@@ -24,7 +30,11 @@ class XFilterService : AccessibilityService() {
             "opcoes do post", "opcoes da postagem", "post options", "more post options",
             "mais opcoes", "mais", "more", "more options", "mas opciones"
         )
-        private val NOT_INT = listOf("nao tenho interesse", "not interested", "no me interesa", "nao me interessa")
+        private val NOT_INT = listOf(
+            "nao tenho interesse", "not interested", "no me interesa", "nao me interessa",
+            "nao curto este anuncio",
+            "esta publicacao nao e util", "this post isn", "esta publicacion no es util"
+        )
         private val MUTE = listOf("silenciar @", "mute @", "silenciar a @")
         private val MENU_HINTS = listOf(
             "denunciar post", "report post", "bloquear @", "block @", "silenciar @", "mute @",
@@ -44,6 +54,11 @@ class XFilterService : AccessibilityService() {
     private var scanQueued = false
     private var settingsVersion = -1
     private var lastSeen = ""
+    private var onHome = false          // só age no feed inicial (Para você / Seguindo)
+    private var coolUntil = 0L          // freio de segurança após falhas seguidas
+    private var failStreak = 0
+    private var bubble: TextView? = null
+    private var bubbleFailed = false
 
     private val handled = LinkedHashSet<String>()    // posts já resolvidos de verdade
     private val dryLogged = LinkedHashSet<String>()  // posts já registrados no modo teste
@@ -59,6 +74,10 @@ class XFilterService : AccessibilityService() {
         override fun run() {
             val now = SystemClock.elapsedRealtime()
             if (now - lastXEvent < 15000 || Prefs.dumpAt(this@XFilterService) > 0) tick()
+            if (bubble != null) {
+                val a = rootInActiveWindow
+                if (a?.packageName?.toString() != PKG) hideBubble()
+            }
             handler.postDelayed(this, 2000)
         }
     }
@@ -66,6 +85,7 @@ class XFilterService : AccessibilityService() {
     private val timeout = Runnable {
         if (state == State.WAIT_MENU) {
             Prefs.addLog(this@XFilterService, "⚠ menu não apareceu. Textos vistos: " + lastSeen.ifEmpty { "(nada)" })
+            registerFailure()
             reset()
             lastAction = SystemClock.elapsedRealtime()
         }
@@ -81,12 +101,14 @@ class XFilterService : AccessibilityService() {
 
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
+        hideBubble()
         super.onDestroy()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event?.packageName?.toString() != PKG) return
         lastXEvent = SystemClock.elapsedRealtime()
+        showBubble()
         if (!scanQueued) {
             scanQueued = true
             handler.postDelayed(scanRunnable, 300)
@@ -124,13 +146,22 @@ class XFilterService : AccessibilityService() {
             handled.clear(); dryLogged.clear(); tries.clear()
         }
         when (state) {
-            State.IDLE -> scanFeed(roots)
+            State.IDLE -> if (Prefs.paused(this)) status("PAUSADO (bolinha)") else scanFeed(roots)
             State.WAIT_MENU -> handleMenu(roots)
         }
     }
 
     private fun scanFeed(roots: List<AccessibilityNodeInfo>) {
         val now = SystemClock.elapsedRealtime()
+        updateScreen(roots)
+        if (!onHome) {
+            status("fora do feed inicial (busca/post/outra tela) — parado")
+            return
+        }
+        if (now < coolUntil) {
+            status("pausa de segurança (falhas seguidas)")
+            return
+        }
         val cfg = Prefs.config(this)
         val hasRules = cfg.words.isNotEmpty() || cfg.accounts.isNotEmpty() ||
             (cfg.interestsMode && cfg.interests.isNotEmpty())
@@ -170,7 +201,7 @@ class XFilterService : AccessibilityService() {
             val key = text.filter { it.isLetter() }.take(90).hashCode().toString()
             val hit = Matcher.check(text, cfg) ?: continue
             hits++
-            val preview = text.replace('\n', ' ').take(90)
+            val preview = snippet(text, hit)
 
             if (dry) {
                 if (dryLogged.add(key)) Prefs.addLog(this, "[TESTE] ${hit.reason}: $preview")
@@ -196,6 +227,7 @@ class XFilterService : AccessibilityService() {
                 handler.postDelayed(timeout, 3500)
             } else {
                 Prefs.addLog(this, "⚠ não consegui tocar no ⋮ (${describe(caret)})")
+                registerFailure()
             }
         }
 
@@ -225,17 +257,105 @@ class XFilterService : AccessibilityService() {
         val pick = if (mute >= 0) mute else notInt
         if (pick >= 0 && clickNode(nodes[pick])) {
             Prefs.incTotal(this)
+            failStreak = 0
             actionTimes.add(SystemClock.elapsedRealtime())
             val icon = if (pick == mute) "🔇 silenciou" else "🚫"
             Prefs.addLog(this, "$icon ${t.hit.reason}: ${t.preview}")
         } else {
             val vistos = labels.filter { it.length in 2..40 }.take(10).joinToString(" | ")
             Prefs.addLog(this, "⚠ menu abriu mas sem a opção. Vi: $vistos")
+            registerFailure()
             performGlobalAction(GLOBAL_ACTION_BACK)
         }
         handled.add(t.key)
         reset()
         lastAction = SystemClock.elapsedRealtime()
+    }
+
+    // ---------------------------------------------------------------- tela / segurança / bolinha
+
+    private fun updateScreen(roots: List<AccessibilityNodeInfo>) {
+        val labels = HashSet<String>()
+        var editText = false
+        var homeId = false
+        for (rt in roots) walk(rt) {
+            val cls = it.className?.toString() ?: ""
+            if (cls.endsWith("EditText")) editText = true
+            if (it.viewIdResourceName?.endsWith("home_navigation_bar_title") == true) homeId = true
+            val t = it.text?.toString()
+            if (!t.isNullOrBlank() && t.length < 40) labels.add(Matcher.norm(t).trim())
+            val d = it.contentDescription?.toString()
+            if (!d.isNullOrBlank() && d.length < 40) labels.add(Matcher.norm(d).trim())
+        }
+        val explicitNeg =
+            (("relevante" in labels) && ("ver comentarios" in labels)) ||
+            (("principais" in labels) && ("mais recentes" in labels)) ||
+            (("top" in labels) && ("latest" in labels))
+        val positive = homeId ||
+            (("para voce" in labels) && ("seguindo" in labels)) ||
+            (("for you" in labels) && ("following" in labels))
+        if (explicitNeg) onHome = false
+        else if (positive) onHome = true
+        else if (editText) onHome = false
+        // sem pista nova: mantém o último estado (a barra do topo some ao rolar)
+    }
+
+    private fun registerFailure() {
+        failStreak++
+        if (failStreak >= 3) {
+            failStreak = 0
+            coolUntil = SystemClock.elapsedRealtime() + 60_000L
+            Prefs.addLog(this, "⚠ 3 falhas seguidas — pausa de 60 s")
+        }
+    }
+
+    private fun showBubble() {
+        if (bubble != null || bubbleFailed) return
+        try {
+            val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            val size = (44 * resources.displayMetrics.density).toInt()
+            val tv = TextView(this)
+            tv.gravity = Gravity.CENTER
+            tv.textSize = 18f
+            tv.setTextColor(Color.WHITE)
+            tv.setOnClickListener {
+                Prefs.setBool(this, "paused", !Prefs.paused(this))
+                updateBubble()
+            }
+            val lp = WindowManager.LayoutParams(
+                size, size,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                PixelFormat.TRANSLUCENT
+            )
+            lp.gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            wm.addView(tv, lp)
+            bubble = tv
+            updateBubble()
+        } catch (e: Exception) {
+            bubbleFailed = true
+            Prefs.addLog(this, "⚠ não consegui criar a bolinha: ${e.message}")
+        }
+    }
+
+    private fun updateBubble() {
+        val tv = bubble ?: return
+        val paused = Prefs.paused(this)
+        tv.text = if (paused) "▶" else "⏸"
+        val bg = GradientDrawable()
+        bg.shape = GradientDrawable.OVAL
+        bg.setColor(if (paused) 0xCCE0245E.toInt() else 0xCC1D9BF0.toInt())
+        tv.background = bg
+    }
+
+    private fun hideBubble() {
+        val tv = bubble ?: return
+        try {
+            (getSystemService(Context.WINDOW_SERVICE) as WindowManager).removeView(tv)
+        } catch (e: Exception) {
+            // já removida
+        }
+        bubble = null
     }
 
     private fun reset() {
@@ -282,6 +402,20 @@ class XFilterService : AccessibilityService() {
         }
         Prefs.addLog(this, "⚠ 0 ⋮ em $nodeCount nós (${roots.size} janelas). " +
             "Clicáveis desc: ${descs.take(12).joinToString(" | ")} · ids: ${ids.take(12).joinToString(" | ")}")
+    }
+
+    // trecho do post em volta da palavra que casou (para o log mostrar o motivo)
+    private fun snippet(text: String, hit: Hit): String {
+        val flat = text.replace('\n', ' ')
+        if (hit.kind == Kind.WORD && !hit.reason.startsWith("re:")) {
+            val i = Matcher.norm(flat).indexOf(Matcher.norm(hit.reason))
+            if (i >= 0) {
+                val a = (i - 35).coerceIn(0, flat.length)
+                val b = (i + hit.reason.length + 55).coerceIn(a, flat.length)
+                return "…" + flat.substring(a, b)
+            }
+        }
+        return flat.take(90)
     }
 
     private fun describe(n: AccessibilityNodeInfo) =

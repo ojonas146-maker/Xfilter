@@ -12,6 +12,7 @@ object Prefs {
     private fun sp(c: Context) = c.getSharedPreferences("xfilter", Context.MODE_PRIVATE)
 
     fun enabled(c: Context) = sp(c).getBoolean("enabled", true)
+    fun paused(c: Context) = sp(c).getBoolean("paused", false)
     fun dryRun(c: Context) = sp(c).getBoolean("dry", false)
     fun interestsMode(c: Context) = sp(c).getBoolean("interestsMode", false)
     fun maxPerHour(c: Context) = sp(c).getInt("maxPerHour", 60)

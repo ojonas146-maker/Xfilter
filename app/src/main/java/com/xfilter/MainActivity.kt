@@ -62,9 +62,10 @@ class MainActivity : Activity() {
         }
         setContentView(ScrollView(this).apply { addView(root) })
 
-        label(root, "X Filter 1.3", 26f)
+        label(root, "X Filter 1.5", 26f)
         status = label(root, "")
         scan = label(root, "")
+        label(root, "No X aparece uma bolinha na lateral esquerda: toque nela para pausar/retomar o filtro.", 12f)
         total = label(root, "", 16f)
         button(root, "ATUALIZAR status e log") { refresh() }
         logView = label(root, "", 12f)
